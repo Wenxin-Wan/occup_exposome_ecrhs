@@ -1,0 +1,1014 @@
+---
+title: "ECRHS_expoosome analytical code"
+output: html_notebook
+---
+
+This script (markdown) aims to produce the results on the paper entitled "Occupational Expoosome and Lung function decline: Findings from the European Community of Respiratory Health Survey".
+
+Due to the sensitivity of the raw data, this script will only contain the super learner modelling and interpretation part. Other parts,  for example, job code cleaning, exposure assignment, will be made unavailable and access to these codes/data shall be made to the corresponding authors.
+
+
+#1. Data prepare
+
+```{r include=FALSE}
+
+### load packages
+
+require(ggplot2)
+require(dplyr)
+require(tidyverse)
+require(doBy)
+require(data.table)
+require(readxl)
+require(janitor)
+require(corrplot)
+require(ggsci)
+require(visdat)
+require(heatmaply)
+require(plotly)
+library(ggstatsplot)
+library(palmerpenguins)
+# require(memisc)
+require(purrr)
+require(writexl)
+library(haven)
+require(rexposome)
+# require(randomForest)
+require(GGally)
+# collective contribution of the variance
+require(FactoMineR)
+library(cluster)    # clustering algorithms
+library(factoextra) # clustering visualization
+library(dendextend) # for comparing two dendrograms
+# for mixed effect model
+require(lmerTest)
+require(lme4)
+require(nlme)
+
+# for network analysis
+require(huge)
+require(igraph)
+## for non-linear term in the mixed model 
+require(mgcv)
+library(labelled)   # labeling data
+library(rstatix)    # summary statistics
+library(ggpubr)     # convenient summary statistics and plots
+library(GGally)     # advanced plot
+library(car)        # useful for anova/wald test
+# library(Epi)        # easy getting CI for model coef/pred
+library(lme4)       # linear mixed-effects models
+library(lmerTest)   # test for linear mixed-effects models
+library(emmeans)    # marginal means
+library(multcomp)   # CI for linear combinations of model coef
+
+require(visdat)  #other packages available for descrip. [link](https://arxiv.org/abs/1904.02101)
+require(caret)
+require(tidyverse)
+require(dplyr)
+require(ggridges)
+require(ggplot2)
+require(corrplot)
+require(magrittr)
+require(plotly)
+require(readxl)
+require(glmnet) # for lasso model
+require(stabs) # for stability selection
+require(randomForest) # basic implementation
+require(ranger)       # a faster implementation of randomForest, will use this for tuning the random forest
+require(caret)        # an aggregator package for performing many machine learning models
+# require(tuneRanger)   # a tool to tune random forest model with ranger package
+require(vip) # we use this package to properly visualise the importance
+require(caret)
+require(iml)
+require(ggrepel)
+require(reshape2)
+require(gridExtra)
+require(kernelshap)
+require(shapviz)
+require(fastshap)
+require(shapviz)
+require(randomForestSRC)
+require(bkmr)
+require(bkmrhat) 
+require(future) # parallel computation enabled
+require(fields)
+
+load("LOCAL_PATH/data/exposure_assigned_sept_15_2024.RData")
+
+link_7_temp <- link_7 %>%
+  mutate(miss_ind = if_else(is.na(ec3_fev1_max) & !is.na(ec1_fev1_max) & !is.na(ec2_fev1_max), "1",
+                            if_else(is.na(ec2_fev1_max) & !is.na(ec1_fev1_max) & !is.na(ec3_fev1_max), "2", "2"))) 
+
+rm(dat_fr_epi, dat_sp_epi, ec_raw, dat_occup_per_job_EC, dat_occup_per_year_linked)
+
+
+exposures_long_EC <- link_7_temp %>%
+  # filter(miss_ind == "complete" | miss_ind == "miss_ec3") %>% # 4701 subjects included
+  dplyr::select(1:175) %>% 
+  pivot_longer(
+    cols = matches("^ec_\\d+_"),  # This selects all columns that start with "ec_" followed by a digit and an underscore
+    names_to = c("follow_up", "exposure_type"),  # Splitting the column name into two new columns
+    names_pattern = "^ec_(\\d+)_(.*)",  # Regex pattern to separate the follow-up from the exposure name
+    values_to = "exposure_level",  # The measured values are renamed to "exposure_level"
+    values_drop_na = F  
+  ) %>% 
+  ### secondary pivot to wider format so to accomondate exposures
+  pivot_wider(
+    id_cols = c(rhineid, follow_up),
+    names_from = "exposure_type",
+    values_from = "exposure_level"
+    ) %>% 
+  dplyr::rename(heavy_lifting = Heav_.lifting) %>% 
+  rename('Diesel engine exhaust' = DEE_pl,
+         # Wood_dusts = Wood_dusts,
+         # wood_JEM = "wood_level(mg/m3)",
+         'Wood dusts' = wood_pl, 
+         Nickel = nickel_p,
+         Silica = RCS_pl,
+         'Organic solvent' = organic_solvents_asJEM,
+         Noise = noise_over_85,
+         Heavy_lifting = heavy_lifting,
+         Endotoxin  = endotoxin
+         ) %>% 
+  dplyr::select(-c("exhaust_fume_asJEM","Endotoxin_asJEM", "wood_level(mg/m3)", "Wood_dusts", "herbicides_asJEM", "insecticides_asJEM", "fungicides_asJEM")) 
+
+base_vars <- c(colnames(exposures_long_EC[,3:53])) # extract exposure name
+
+link_delta_exp <- exposures_long_EC %>%
+  pivot_wider(
+    id_cols = rhineid,
+    names_from = follow_up,
+    names_prefix = "ec_",
+    values_from = 3:53,
+    names_glue = "ec_{follow_up}_{.value}"
+    ) %>%
+  # calculate delta
+  mutate(across(all_of(paste0("ec_1_", base_vars)),
+                list(delta = ~ get(gsub("ec_1", "ec_2", cur_column())) - .),
+                .names = "{gsub('ec_1_', 'delta1_', .col)}")) %>% # 
+  mutate(across(all_of(paste0("ec_1_", base_vars)),
+                list(delta = ~ get(gsub("ec_1", "ec_3", cur_column())) - .),
+                .names = "{gsub('ec_1_', 'delta2_', .col)}")) %>%   
+  # #### using the duration of FUP as the exposure of interest
+  inner_join(epi_link4[,c("rhineid", "ec1_year", "ec2_year", "ec3_year")], by = "rhineid") %>%
+  mutate(across(starts_with("delta1_"), ~ . / (ec2_year - ec1_year))) %>%  # here we calculate the average delta in exposure
+  mutate(across(starts_with("delta2_"), ~ . / (ec3_year - ec1_year))) %>% # here we calculate the average delta in exposure
+  dplyr::select(1, 155:256) %>% 
+  pivot_longer(
+    cols = matches("^delta\\d+_"),  # This selects all columns that start with "ec_" followed by a digit and an underscore
+    names_to = c("occassion", "exposure_type"),  # Splitting the column name into two new columns
+    names_pattern = "^delta(\\d+)_(.*)",  # Regex pattern to separate th e follow-up from the exposure name
+    values_to = "exposure_delta",  # The measured values are renamed to "exposure_level"
+    values_drop_na = F  
+  ) %>% 
+  ### secondary pivot to wider format so to accomondate exposures
+  pivot_wider(
+    id_cols = c(rhineid, occassion),
+    names_from = "exposure_type",
+    values_from = "exposure_delta"
+  )
+  
+
+link_delta_out <- link_7_temp %>%
+  dplyr::select(1, 176:181) %>%
+  inner_join(epi_link4[,c("rhineid", "ec1_year", "ec2_year", "ec3_year")], by = "rhineid") %>% 
+  mutate(delta1_fev1 = (ec2_fev1_max - ec1_fev1_max),
+         delta2_fev1 = (ec3_fev1_max - ec1_fev1_max)) %>% # here we use the decline rate of lung function
+  pivot_longer(
+    cols = matches("^delta\\d+_.+"),
+    names_to = c("occassion", "outcome_type"),
+    names_pattern = "^delta(\\d+)_(.+)",
+    values_to = "outcome_value",
+    values_drop_na = F
+  ) %>%
+  pivot_wider(
+    id_cols = c(rhineid, occassion),
+    # id_cols =
+    names_from = outcome_type,
+    values_from = outcome_value
+  ) # missing pattern matched, 1967 missing the fev1 
+
+out_temp <- link_7_temp %>%
+  # filter(miss_ind == "complete" | miss_ind == "miss_ec3") %>% # 4701 subjects included
+  dplyr::select(1, 176:181) %>%
+  inner_join(epi_link4[,c("rhineid", "ec1_year", "ec2_year", "ec3_year")], by = "rhineid") %>% 
+  mutate(
+    t0 = 0,
+    t1 = ec2_year - ec1_year,
+    t2 = ec3_year - ec1_year
+  ) 
+
+link_time_since <- out_temp[,c(1, 11:13)] %>% 
+  pivot_longer(
+    cols = 2:4,
+    names_to = "occassion",
+    names_pattern = "^t(\\d+)",
+    values_to = "time",
+    values_drop_na = F
+  ) %>% 
+  filter(occassion %in% c(1,2))
+
+
+delta_packyr_long_EC <- link_7_temp %>%
+  dplyr::select(rhineid, packyr_1_full, packyr_1to2_full, packyr_2to3_full) %>%
+  mutate(packyr_2to3_full = if_else(!is.na(packyr_1to2_full), packyr_1to2_full + packyr_2to3_full, packyr_2to3_full)) %>% 
+  rename(packyr_0_full = packyr_1_full) %>% 
+  # mutate(packyr_2to3_full = packyr_1to2_full + packyr_2to3_full) %>% # here calculate the cumulative pack-yr across the FUP period ?covered by two line before
+  rename_with(~ str_replace(., "packyr_", "r"), starts_with("packyr_")) %>% 
+  pivot_longer(
+    cols = -rhineid,
+    names_to = "occassion",
+    names_pattern = "^r(\\d+)",
+    values_to = "packyr"
+    )
+
+# baseline_packyr <- delta_packyr_long_EC %>% 
+#   filter(occassion == 0)
+  
+ave_packyr <- delta_packyr_long_EC %>% 
+  filter(!occassion == 0) %>% 
+  left_join(link_time_since, by = c("rhineid", "occassion")) %>% 
+  mutate(packyr = packyr / time) %>% 
+  dplyr::select(1:3)
+  
+
+link_delta <- link_7_temp %>% 
+  filter(!is.na(packyr_1_full)) %>% 
+  dplyr::select(rhineid, sex, centre, early_life_risk_score, home_env_risk_score ,height, ec1_weight, age_1, education, air_pollution_score, packyr_1_full, miss_ind) %>%
+  rename(occassion = miss_ind) %>% 
+  inner_join(ave_packyr, by = c("rhineid", "occassion")) %>% 
+  # inner_join(delta_packyr_long_EC, by = c("rhineid", "occassion")) %>% 
+  # left_join(link_time_since, by = c("rhineid", "occassion")) %>% 
+  left_join(link_delta_exp, by = c("rhineid", "occassion")) %>% 
+  left_join(link_delta_out, by = c("rhineid", "occassion")) %>% 
+  ### here we create other variables
+  # mutate(early_life_risk_score = early_life_risk_score + coal_wood_used_at_age5) %>% # due to high degree missingness in early coal/wood use, decision is to drop that variable
+  distinct() %>% 
+  # dplyr::select(-occassion) %>% 
+  mutate(education = as.numeric(education)) 
+
+
+link_delta_out2 <- link_7_temp %>%
+  dplyr::select(1, 176:181) %>%
+  inner_join(epi_link4[,c("rhineid", "ec1_year", "ec2_year", "ec3_year")], by = "rhineid") %>% 
+  mutate(delta1_fvc = (ec2_fvc_max - ec1_fvc_max),
+         delta2_fvc = (ec3_fvc_max - ec1_fvc_max)) %>% # here we use the decline rate of lung function
+  pivot_longer(
+    cols = matches("^delta\\d+_.+"),
+    names_to = c("occassion", "outcome_type"),
+    names_pattern = "^delta(\\d+)_(.+)",
+    values_to = "outcome_value",
+    values_drop_na = F
+  ) %>%
+  pivot_wider(
+    id_cols = c(rhineid, occassion),
+    # id_cols =
+    names_from = outcome_type,
+    values_from = outcome_value
+  ) # missing pattern matched, 1967 missing the fev1 
+
+link_delta_out3 <- link_7_temp %>%
+  dplyr::select(1, 176:181) %>%
+  inner_join(epi_link4[,c("rhineid", "ec1_year", "ec2_year", "ec3_year")], by = "rhineid") %>% 
+  mutate(ec1_fev1fvc = ec1_fev1_max / ec1_fvc_max,
+         ec2_fev1fvc = ec2_fev1_max / ec2_fvc_max,
+         ec3_fev1fvc = ec3_fev1_max / ec3_fvc_max) %>% 
+  filter(ec2_fev1fvc < 1| is.na(ec2_fev1fvc)) %>% #filter out abnoraml ratio: 3 ppls observed
+  mutate(delta1_fev1fvc = (ec2_fev1fvc - ec1_fev1fvc),
+         delta2_fev1fvc = (ec3_fev1fvc - ec1_fev1fvc)) %>% # here we use the decline rate of lung function
+  pivot_longer(
+    cols = matches("^delta\\d+_.+"),
+    names_to = c("occassion", "outcome_type"),
+    names_pattern = "^delta(\\d+)_(.+)",
+    values_to = "outcome_value",
+    values_drop_na = F
+  ) %>%
+  pivot_wider(
+    id_cols = c(rhineid, occassion),
+    # id_cols =
+    names_from = outcome_type,
+    values_from = outcome_value
+  ) # missing pattern matched, 1967 missing the fev1 
+
+
+link_delta_complete_all_out <- link_delta %>% 
+  left_join(link_delta_out2, by = c("rhineid", "occassion")) %>% 
+  left_join(link_delta_out3, by = c("rhineid", "occassion")) %>% 
+  distinct() %>% 
+  dplyr::select(-occassion) %>% 
+  mutate(education = as.numeric(education)) 
+
+
+link_delta_complete_all_out <- na.omit(link_delta_complete_all_out) %>%  # here we omitted some folks with 
+  mutate(across(13:63, ~scale(.,scale = T, center = F))) %>% 
+  rename_with(~ gsub(" ", "_", .x) %>%
+                gsub(",", "", .) %>%
+                gsub("/", "_", .) %>%
+                gsub("\\(", "", .) %>%
+                gsub("\\)", "", .), everything()) 
+
+# Get all objects in the environment
+all_objects <- ls()
+
+# Remove all objects except link_delta_complete_all_out
+rm(list = setdiff(all_objects, "link_delta_complete_all_out"))
+rm("all_objects")
+# save(link_delta_complete_all_out, file = "link_delta_complete_all_out.Rdata")
+
+```
+
+
+#2. Super learner
+
+##2.1 Building models
+```{r}
+
+x <- link_delta_complete_all_out[,2:63] %>% 
+  dplyr::select(-All_pesticides) %>%
+  dplyr::select(-'Vapours_Gases_Dust_And_Fumes') 
+
+
+x <- as.data.frame(as.matrix(x))
+
+y1 <- as.matrix(link_delta_complete_all_out[,64])
+y2 <- as.matrix(link_delta_complete_all_out[,65])
+y3 <- as.matrix(link_delta_complete_all_out[,66])
+
+
+SL.library <- c("SL.mean", "SL.glm", "SL.gam", 
+                "SL.glmnet", "SL.ksvm", "SL.nnet",
+                "SL.ranger", "SL.earth",  "SL.xgboost")
+
+(num_cores = RhpcBLASctl::get_num_cores())
+options(mc.cores = 8)
+
+# #fev1
+sl_fev1 <- SuperLearner(Y = y1, X = x, family = gaussian(),
+                       SL.library = SL.library,
+                       cvControl = list(V = 10),
+                       verbose = T)
+# #fvc
+sl_fvc <- SuperLearner(Y = y2, X = x, family = gaussian(),
+                       SL.library = SL.library,
+                       cvControl = list(V = 10),
+                       verbose = T)
+
+sl_ratio <- SuperLearner(Y = y3, X = x, family = gaussian(),
+                       SL.library = SL.library,
+                       cvControl = list(V = 10),
+                       verbose = T)
+
+```
+
+
+##2.2 LOGI/LOGO analysis
+
+
+```{r}
+
+##########################################################################
+########################### Run LOGIO
+require(foreach)
+require(doParallel)
+
+num_cores <- RhpcBLASctl::get_num_cores()
+registerDoParallel(cores = 15)
+
+
+
+# Define the function to calculate RMSE
+calc_rmse <- function(predicted, actual) {
+  sqrt(mean((predicted - actual)^2))
+}
+
+# Function to process a single iteration for one outcome
+process_iteration <- function(i, x, y, outcome_name, group_info) {
+  set.seed(i)
+  
+  # Split the data into training (75%) and test (25%) sets
+  trainIndex <- createDataPartition(y, p = 0.75, list = FALSE)
+  x_train <- x[trainIndex, ]
+  y_train <- y[trainIndex]
+  x_test <- x[-trainIndex, ]
+  y_test <- y[-trainIndex]
+  
+  # Approach 1: Drop Group Importance
+  drop_group_importance <- function(group_info) {
+    # Fit the complete SuperLearner model
+    sl <- SuperLearner(Y = y_train, X = x_train, family = gaussian(), 
+                       SL.library = SL.library, cvControl = list(V = 10), verbose = FALSE)
+    
+    # Predict on the test set
+    pred <- predict(sl, newdata = x_test, onlySL = TRUE)$pred
+    
+    # Calculate the RMSE for the complete model
+    complete_rmse <- calc_rmse(pred, y_test)
+    
+    # Calculate RMSE when each group is omitted
+    unique_groups <- unique(group_info$group)
+    rmse_omit <- sapply(unique_groups, function(group) {
+      omit_vars <- group_info$variable[group_info$group == group]
+      
+      x_train_omit <- x_train[, !colnames(x_train) %in% omit_vars, drop = FALSE]
+      x_test_omit <- x_test[, !colnames(x_test) %in% omit_vars, drop = FALSE]
+      
+      sl_omit <- SuperLearner(Y = y_train, X = x_train_omit, family = gaussian(), 
+                              SL.library = SL.library, cvControl = list(V = 10), verbose = FALSE)
+      pred_omit <- predict(sl_omit, newdata = x_test_omit, onlySL = TRUE)$pred
+      
+      calc_rmse(pred_omit, y_test)
+    })
+    
+    c(complete_rmse, rmse_omit)
+  }
+  
+  # Approach 2: Group Only Importance
+  group_only_importance <- function(group_info) {
+    base_columns <- colnames(x)[1:11]
+    
+    # Base model (columns 1:11)
+    x_train_base <- x_train[, base_columns]
+    x_test_base <- x_test[, base_columns]
+    sl_base <- SuperLearner(Y = y_train, X = x_train_base, family = gaussian(), 
+                            SL.library = SL.library, cvControl = list(V = 10), verbose = FALSE)
+    
+    pred_base <- predict(sl_base, newdata = x_test_base, onlySL = TRUE)$pred
+    base_rmse <- calc_rmse(pred_base, y_test)
+    
+    # Calculate RMSE for each group
+    unique_groups <- unique(group_info$group)
+    rmse_group <- sapply(unique_groups, function(group) {
+      group_vars <- group_info$variable[group_info$group == group]
+      
+      x_train_group <- cbind(x_train[, base_columns], x_train[, group_vars])
+      x_test_group <- cbind(x_test[, base_columns], x_test[, group_vars])
+      
+      sl_group <- SuperLearner(Y = y_train, X = x_train_group, family = gaussian(), 
+                               SL.library = SL.library, cvControl = list(V = 10), verbose = FALSE)
+      
+      pred_group <- predict(sl_group, newdata = x_test_group, onlySL = TRUE)$pred
+      
+      calc_rmse(pred_group, y_test)
+    })
+    
+    c(base_rmse, rmse_group)
+  }
+  
+  # Run both approaches
+  drop_group_results <- drop_group_importance(group_info)
+  group_only_results <- group_only_importance(group_info)
+  
+  list(
+    outcome = outcome_name,
+    iteration = i,
+    drop_group = drop_group_results,
+    group_only = group_only_results
+  )
+}
+
+# Main execution
+
+outcomes <- list(
+  y1 = link_delta_complete_all_out %>% pull(fev1),
+  y2 = link_delta_complete_all_out %>% pull(fvc),
+  y3 = link_delta_complete_all_out %>% pull(fev1fvc)
+  )
+
+group_info <- grp_info
+
+
+all_results <- foreach(outcome_name = names(outcomes), .combine = 'c') %:%
+  foreach(i = 1:100, .combine = 'c', .packages = c('SuperLearner', 'caret')) %dopar% {
+    cat("Processing outcome:", outcome_name, "iteration:", i, "\n")
+    result <- process_iteration(i, x, outcomes[[outcome_name]], outcome_name, group_info)
+    # Save the result to CSV at the end of each iteration
+    write.csv(result, file = paste0("results_", outcome_name, "_iteration_", i, ".csv"))
+    list(result)
+  }
+
+
+# Set working directory for all_results
+
+setwd("LOCAL_PATH/result/iter_store_april")
+
+# Define a function to read and combine CSV files
+combine_csv_files <- function() {
+  
+  # Create an empty list to store data frames
+  combined_data <- list()
+  
+  # Loop through the values of y and iteration
+  for (y in c("y1", "y2", "y3")) {
+    for (iteration in 1:100) {
+      # Construct the file name
+      file_name <- paste0("results_", y, "_iteration_", iteration, ".csv")
+      
+      # Check if the file exists
+      if (file.exists(file_name)) {
+        # Print the file name to verify the correct files are being read
+        print(paste("Reading file:", file_name))
+        
+        # Read the file and append it to the list
+        data <- read.csv(file_name)
+        combined_data[[length(combined_data) + 1]] <- data
+      } else {
+        warning(paste("File not found:", file_name))
+      }
+    }
+  }
+  
+  # Combine all data frames in the list using rbind
+  combined_data <- do.call(rbind, combined_data)
+  
+  return(combined_data)
+}
+
+# Run the function and store the combined data
+combined_data <- combine_csv_files()
+
+combined_data2 <- combined_data %>% 
+  mutate(X = if_else(X == "", "base", X)) %>% 
+  rename(group = X)
+
+base <- combined_data2 %>% filter(group == "base") %>% rename(drop_group_b = drop_group, group_only_b = group_only)
+
+dat <- combined_data2 %>% 
+  filter(group != "base") %>%
+  left_join(base, by = c("outcome", "iteration")) %>%
+  mutate(diff_LOGO = drop_group - drop_group_b,
+         diff_LOGI = group_only - group_only_b) %>% 
+  mutate(diff_LOGO_perc = diff_LOGO * 100/ drop_group_b,
+         diff_LOGI_perc = diff_LOGI *100 / group_only_b) %>% 
+  mutate(outcome = if_else(outcome == "y1", "FEV1",
+                      if_else(outcome == "y2", "FVC",
+                          if_else(outcome == "y3", "FEV1/FVC", NA)))) %>% 
+  mutate(outcome = factor(outcome, 
+                          levels = c("FEV1", "FVC", "FEV1/FVC"),
+                          labels = c("FEV1", "FVC", "FEV1/FVC")))
+
+
+# Process dat1 for "diff_LOGI"
+dat1 <- dat %>% 
+  dplyr::select(group.x, outcome, 11, 12) %>% 
+  rename(group = group.x) %>%
+  pivot_longer(cols = 3:4, names_to = "method", values_to = "delta_rmse") %>% 
+  filter(method == "diff_LOGI_perc") 
+
+# Reorder group in dat1 based on median delta_rmse for LOGI
+dat1$group <- with(dat1, reorder(group, delta_rmse, median, decreasing = F))
+
+# Plot the LOGI data (p1)
+p1 <- dat1 %>% 
+  filter(!group == "covariates") %>% 
+  ggplot(aes(x = group, y = delta_rmse, fill = outcome)) +
+  geom_boxplot(outliers = FALSE, alpha = 0.8) +
+  scale_fill_npg(alpha = 0.7) +
+  geom_hline(yintercept = 0, colour = "black", linetype = "dashed") +
+  xlab("") + ylab("Relative Change in RMSE (%)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1,size =9), legend.title = element_blank()) # Rotate x-axis labels
+
+p1
+# Process dat2 for "diff_LOGO", using the same group order from dat1
+###  alter the plot to use the original ranking in dat2 (LOGO)
+dat2 <- dat %>% 
+  # group_by(outcome, group.x) %>%
+  # mutate(across(c(diff_LOGI, diff_LOGO), ~ scale(., scale = T, center = T))) %>%
+  # ungroup() %>%   
+  dplyr::select(group.x, outcome, 11, 12) %>% 
+  rename(group = group.x) %>%
+  pivot_longer(cols = 3:4, names_to = "method", values_to = "delta_rmse") %>% 
+  filter(method == "diff_LOGO_perc")
+
+# dat2$group <- factor(dat2$group, levels = levels(dat2$group))
+dat2$group <- with(dat2, reorder(group, delta_rmse, median, decreasing = T))
+
+# Plot the LOGO data (p2)
+p2 <- dat2 %>% 
+  filter(!group == "covariates") %>% 
+  ggplot(aes(x = group, y = delta_rmse, fill = outcome)) +
+  geom_boxplot(outliers = F, alpha = 0.8) +
+  scale_fill_npg(alpha = 0.7) +
+  geom_hline(yintercept = 0, colour = "black", linetype = "dashed") +
+  xlab("") + ylab("") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1,size =9), legend.title = element_blank()) # Rotate x-axis labels
+
+p2
+
+# Combine both plots with patchwork, sharing the same legend
+combined_plot <- p1 + p2 + plot_layout(ncol = 2, guides = "collect") +   
+  plot_annotation(tag_levels = 'a', tag_prefix = "(", tag_suffix = ")", theme = theme(element_text(size = 16))) & theme(legend.position = 'bottom', plot.tag.position = c(0.1, 0.99)) 
+
+# Display the combined plot
+combined_plot
+
+# export parameters: 12.5 * 6 (pdf, landscape)
+
+
+```
+
+
+#3. G-computation (ACE)
+
+
+```{r}
+
+#############################################################################################
+#############################################################################################
+#############################################################################################
+############################### update Nov (removal of VGDF) ################################
+
+# remove VDGF (subsequently require re-fit of SL)
+link_delta_complete_all_out <- link_delta_complete_all_out %>% 
+  dplyr::select(-Vapours_Gases_Dust_And_Fumes) %>% 
+  dplyr::select(-All_pesticides)
+
+# define x and y
+x <- link_delta_complete_all_out[,2:61]
+x <- as.data.frame(lapply(x, function(x) as.numeric(as.character(x))))
+
+y1 <- link_delta_complete_all_out$fev1
+y2 <- link_delta_complete_all_out$fvc
+y3 <- link_delta_complete_all_out$fev1fvc
+
+# gather updated exposure groups
+grp_info <- read_delim("group_info_nov.csv", delim = ";", escape_double = FALSE, trim_ws = TRUE)
+grp_info_cov <- data.frame(variable = colnames(x)[1:11], group = "covariates")
+grp_info <- rbind(grp_info, grp_info_cov)
+feature_groups <- split(grp_info$variable, grp_info$group)
+
+### develop outcome specific SL models
+
+# Removed duplicate SL.ranger
+SL.library <- c("SL.ranger", "SL.glm", "SL.gam",
+                "SL.glmnet", "SL.ksvm", "SL.nnet",
+                "SL.earth", "SL.xgboost", "SL.mean")
+
+(num_cores = RhpcBLASctl::get_num_cores())
+options(mc.cores = 59)
+
+set.seed(112)
+# fev1
+sl_fev1 <- SuperLearner(Y = y1, X = x, family = gaussian(), 
+                        SL.library = SL.library, 
+                        cvControl = list(V = 10),
+                        verbose = TRUE)
+# fvc
+sl_fvc <- SuperLearner(Y = y2, X = x, family = gaussian(),
+                       SL.library = SL.library,
+                       cvControl = list(V = 10),
+                       verbose = TRUE)
+# fev1fvc
+sl_ratio <- SuperLearner(Y = y3, X = x, family = gaussian(),
+                         SL.library = SL.library,
+                         cvControl = list(V = 10),
+                         verbose = TRUE)
+
+# --------------------------
+# 1. Set Up Parallel Cluster
+# --------------------------
+n_cores <- max(1, parallel::detectCores() - 1)
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+# ------------------------------------------------------------
+# 2. Define Quantile Levels for High-Exposure (90th removed)
+# ------------------------------------------------------------
+high_quantiles <- c(0.10, 0.25, 0.5, 0.75, 0.9)
+
+# --------------------------------------------
+# 3. Define Subsampling Parameters
+# --------------------------------------------
+subsample_frac <- 0.632  # commonly used subsampling fraction
+R_SUBSAMPLE <- 500      # Number of subsamples
+
+# -----------------------------------------------------------
+# 4. Precompute Quantiles for x (for each variable and each quantile)
+# -----------------------------------------------------------
+precomputed_quantiles <- lapply(high_quantiles, function(q) {
+  sapply(colnames(x), function(var) {
+    valid_data <- x[[var]][x[[var]] > 0]
+    if(length(valid_data) > 0) as.numeric(quantile(valid_data, probs = q, na.rm = TRUE)) else 0
+  })
+})
+names(precomputed_quantiles) <- as.character(high_quantiles)
+
+# -----------------------------------------------------------
+# 5. Define Functions for Calculating ACE and Subsampling
+# -----------------------------------------------------------
+
+# calc_ace: Computes ACE using a given model on the specified dataset.
+calc_ace <- function(model, data, exposure_group, quantile_value, precomputed_quantiles) {
+  # Retrieve precomputed quantiles for the specified quantile value and group
+  q_values <- precomputed_quantiles[[as.character(quantile_value)]][exposure_group]
+  
+  # Create low and high exposure scenarios for each exposure in the group
+  data_low <- data_high <- data
+  for (exp in exposure_group) {
+    data_low[[exp]]  <- 0
+    data_high[[exp]] <- q_values[exp]
+  }
+  
+  # Predict outcomes using the refitted model
+  pred_low  <- predict(model, newdata = data_low, onlySL = TRUE)$pred
+  pred_high <- predict(model, newdata = data_high, onlySL = TRUE)$pred
+  
+  # Return the average difference (ACE)
+  mean(pred_high) - mean(pred_low)
+}
+
+# subsample_ace: Refits the SuperLearner on a bootstrap subsample and computes ACE.
+# The model is refitted on a subsample, and then ACE is computed on the full data.
+subsample_ace <- function(full_data, outcome_vector, indices, exposure_group, quantile_value, precomputed_quantiles) {
+  tryCatch({
+    # Prevent nested parallelization issues: limit BLAS threads to 1
+    RhpcBLASctl::blas_set_num_threads(1)
+    
+    # Subset the outcome and predictors based on bootstrap indices
+    Y_sub <- outcome_vector[indices]
+    X_sub <- full_data[indices, , drop = FALSE]
+    
+    # Refit SuperLearner on the bootstrap subsample
+    sl_model_sub <- SuperLearner(Y = Y_sub, X = X_sub, family = gaussian(), 
+                                 SL.library = SL.library, 
+                                 cvControl = list(V = 10))
+    
+    # Compute ACE on the full dataset using the refitted model
+    ace <- calc_ace(sl_model_sub, full_data, exposure_group, quantile_value, precomputed_quantiles)
+    return(ace)
+  }, error = function(e) {
+    warning(paste("Error in subsample_ace:", e$message))
+    return(NA)
+  })
+}
+
+# ------------------------------------------------------------------
+# 6. Compute Point Estimates Using the Full Model
+# ------------------------------------------------------------------
+
+# Define outcomes and pre-fitted models
+outcomes <- list(fev1 = sl_fev1, fvc = sl_fvc, ratio = sl_ratio)
+
+# Create parameter grid for outcomes, feature groups, and quantiles
+param_grid <- expand.grid(
+  Outcome      = names(outcomes),
+  FeatureGroup = names(feature_groups),
+  Quantile     = high_quantiles,
+  stringsAsFactors = FALSE
+)
+
+# Compute point estimates (using full data predictions)
+point_estimates <- foreach(i = 1:nrow(param_grid), .combine = rbind) %do% {
+  outcome_name   <- param_grid$Outcome[i]
+  group_name     <- param_grid$FeatureGroup[i]
+  quantile_value <- param_grid$Quantile[i]
+  
+  model          <- outcomes[[outcome_name]]
+  exposure_group <- feature_groups[[group_name]]
+  
+  ace <- calc_ace(model, x, exposure_group, quantile_value, precomputed_quantiles)
+  
+  data.frame(
+    Outcome      = outcome_name,
+    FeatureGroup = group_name,
+    Quantile     = quantile_value,
+    ACE          = ace,
+    stringsAsFactors = FALSE
+  )
+}
+
+# ------------------------------------------------------------------
+# 7. Generate Subsamples and Compute ACE for Confidence Intervals
+# ------------------------------------------------------------------
+
+# Expanded grid including subsample iterations
+param_grid_expanded <- expand.grid(
+  Outcome      = names(outcomes),
+  FeatureGroup = names(feature_groups),
+  Quantile     = high_quantiles,
+  Subsample    = 1:R_SUBSAMPLE,
+  stringsAsFactors = FALSE
+)
+
+# Create and store subsample indices for reproducibility
+set.seed(112)  # For reproducibility
+subsample_indices <- lapply(1:R_SUBSAMPLE, function(i) {
+  sample(seq_len(nrow(x)), size = round(subsample_frac * nrow(x)), replace = FALSE)
+})
+
+# Parallel computation of ACE for each combination and bootstrap subsample
+ace_subsamples <- foreach(i = 1:nrow(param_grid_expanded), .combine = rbind, 
+                          .packages = c("SuperLearner", "RhpcBLASctl"),
+                          .export = c("subsample_ace", "calc_ace", "precomputed_quantiles", 
+                                      "SL.library", "x", "y1", "y2", "y3", "feature_groups")) %dopar% {
+                                        outcome_name   <- param_grid_expanded$Outcome[i]
+                                        group_name     <- param_grid_expanded$FeatureGroup[i]
+                                        quantile_value <- param_grid_expanded$Quantile[i]
+                                        subsample_id   <- param_grid_expanded$Subsample[i]
+                                        
+                                        exposure_group <- feature_groups[[group_name]]
+                                        indices        <- subsample_indices[[subsample_id]]
+                                        
+                                        # Select the appropriate outcome vector based on outcome_name
+                                        outcome_vector <- switch(outcome_name,
+                                                                 fev1 = y1,
+                                                                 fvc  = y2,
+                                                                 ratio = y3)
+                                        
+                                        # Compute ACE using the refitted model on the full data
+                                        ace <- subsample_ace(x, outcome_vector, indices, exposure_group, quantile_value, precomputed_quantiles)
+                                        
+                                        data.frame(
+                                          Outcome      = outcome_name,
+                                          FeatureGroup = group_name,
+                                          Quantile     = quantile_value,
+                                          Subsample    = subsample_id,
+                                          ACE          = ace,
+                                          stringsAsFactors = FALSE
+                                        )
+                                      }
+
+# ---------------------------
+# 8. Aggregate Results and Compute 95% Confidence Intervals
+# ---------------------------
+ci_results <- ace_subsamples %>%
+  group_by(Outcome, FeatureGroup, Quantile) %>%
+  summarise(
+    CI_Lower = quantile(ACE, probs = 0.025, na.rm = TRUE),
+    CI_Upper = quantile(ACE, probs = 0.975, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+# Merge point estimates with their corresponding confidence intervals
+final_results <- merge(point_estimates, ci_results, by = c("Outcome", "FeatureGroup", "Quantile"))
+
+# Add descriptive quantile labels (e.g., "10th Percentile")
+final_results$QuantileLabel <- paste0(as.integer(final_results$Quantile * 100), "th Percentile")
+
+# Reorder columns for clarity
+final_results <- final_results[, c("Outcome", "FeatureGroup", "QuantileLabel", "ACE", "CI_Lower", "CI_Upper")]
+
+# Stop the parallel cluster
+stopCluster(cl)
+
+# ---------------------------
+# 9. Save and Display the Output
+# ---------------------------
+write.csv(final_results, "ace_results_subsampling.csv", row.names = FALSE)
+saveRDS(subsample_indices, "subsample_indices.rds")
+
+# Print the final results
+print(final_results)
+
+# ---------------------------
+# 10. Compute Bias-Corrected ACE (Optional)
+# ---------------------------
+
+# Compute the mean of bootstrap estimates
+bootstrap_means <- ace_subsamples %>%
+  group_by(Outcome, FeatureGroup, Quantile) %>%
+  summarise(
+    Bootstrap_Mean_ACE = mean(ACE, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute bias: Difference between the bootstrap mean and the original point estimate
+bias_correction <- merge(point_estimates, bootstrap_means, 
+                         by = c("Outcome", "FeatureGroup", "Quantile"))
+
+bias_correction <- bias_correction %>%
+  mutate(Bias = Bootstrap_Mean_ACE - ACE,  # Bias estimation
+         Bias_Corrected_ACE = ACE - Bias)  # Corrected ACE
+
+# Merge confidence intervals into bias-corrected results
+final_bias_corrected_results <- merge(bias_correction, ci_results, 
+                                      by = c("Outcome", "FeatureGroup", "Quantile"))
+
+# Add descriptive quantile labels
+final_bias_corrected_results$QuantileLabel <- paste0(as.integer(final_bias_corrected_results$Quantile * 100), "th Percentile")
+
+# Reorder columns
+final_bias_corrected_results <- final_bias_corrected_results[, 
+                                                             c("Outcome", "FeatureGroup", "QuantileLabel", "ACE", "Bias", "Bias_Corrected_ACE", "CI_Lower", "CI_Upper")]
+
+# Save bias-corrected results
+write.csv(final_bias_corrected_results, "bias_corrected_ace_results.csv", row.names = FALSE)
+
+# Print the final results with bias correction
+print(final_bias_corrected_results)
+
+
+
+
+
+nace_comb <- 
+  data.frame(read.csv("LOCAL_PATH/result/bias_corrected_ace_results_500iters.csv", stringsAsFactors = F)) %>%
+  filter(!FeatureGroup == "covariates") %>% 
+  filter(FeatureGroup %in% c("Ergonomic Stressors","Physical Stressors", "Gaseous Substances and Fumes" ,"Particulates and Fibrous Dusts")) %>% 
+  mutate(
+    outcome = recode(Outcome,
+                     fev1  = "FEV1 (mL/yr)",
+                     fvc   = "FVC (mL/yr)",
+                     ratio = "FEV1/FVC ratio (%/yr)")) %>% 
+  mutate(outcome = factor(outcome, levels = c("FEV1 (mL/yr)", "FVC (mL/yr)", "FEV1/FVC ratio (%/yr)"))) %>%
+  filter(!QuantileLabel == "90th Percentile") %>% 
+  filter(!QuantileLabel == "75th Percentile") %>%   
+  mutate(QuantileLabel = factor(QuantileLabel, 
+                           levels = c("10th Percentile", "25th Percentile", "50th Percentile", "75th Percentile", "90th Percentile"))) %>% 
+  mutate(across(4:8, ~if_else(Outcome == "ratio", .*100, .*1000)))
+
+# --- 1. Sort the exposure groups by mean FEV1 (more negative at the top) ---
+fev1_order <- nace_comb %>%
+  filter(Outcome == "fev1") %>%
+  group_by(FeatureGroup) %>%
+  summarize(mean_ACE = mean(ACE, na.rm = TRUE)) %>%
+  arrange(mean_ACE) %>%  # most negative first
+  pull(FeatureGroup)
+
+# Reorder FeatureGroup factor levels accordingly
+nace_comb$FeatureGroup <- factor(nace_comb$FeatureGroup, levels = fev1_order)
+
+# --- 2. Compute separation positions between FeatureGroups ---
+unique_groups <- levels(nace_comb$FeatureGroup)
+n_groups <- length(unique_groups)
+sep_positions <- if(n_groups > 1) seq(1.5, n_groups - 0.5, by = 1) else NULL
+
+# --- 3. Build the plot ---
+# Define a position dodge to separate quantile estimates within each FeatureGroup
+dodge <- position_dodge(width = 0.7)
+
+p2 <- ggplot(nace_comb, aes(x = FeatureGroup, y = ACE, 
+                           color = outcome, shape = QuantileLabel)) +
+  # Add dashed separation lines between groups (vertical, becomes horizontal after coord_flip)
+  {if(!is.null(sep_positions)) 
+      geom_vline(xintercept = sep_positions, linetype = "dashed", 
+                 color = "gray50", size = 0.5)
+    else NULL} +
+  geom_point(size = 3.6, position = dodge) +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), 
+                width = 0.3, linewidth = 0.9, position = dodge) +
+  # Map specific colours to outcomes but remove the legend for colour
+  scale_color_manual(values = c(
+  "FEV1 (mL/yr)" = "#1B1B1B",      # Almost black, for primary outcome
+  "FVC (mL/yr)"  = "#377EB8",      # Blue, colorblind-friendly
+  "FEV1/FVC ratio (%/yr)" = "#4D4D4D"),  # Dark grey, neutral and professional
+                     guide = "none") +
+  # Map shapes to the quantile levels
+  scale_shape_manual(values = c("10th Percentile" = 15, 
+                                "25th Percentile" = 16, 
+                                "50th Percentile" = 17, 
+                                "75th Percentile" = 18, 
+                                "90th Percentile" = 8)) +
+  theme_classic(base_size = 14) +
+  theme(
+    # Bold only the FeatureGroup (exposure group) text on the axis (after flip, this is axis.text.y)
+    axis.text.y = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    legend.title = element_blank(),
+    legend.position = "top",
+    panel.grid.minor = element_blank(),
+    panel.spacing = unit(1, "lines")
+  ) +
+  labs(y = "ACE", shape = "High Exposure Quantile") +
+  # Add expansion to create spacing between groups on the discrete axis
+  scale_x_discrete(expand = expansion(mult = c(0.05, 0.05))) +
+  # Reference line at zero
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "gray1") +
+  # Flip coordinates so FeatureGroup appears on the vertical axis
+  coord_flip() +
+  # Facet by outcome if desired (you can remove facet_wrap if a single panel is preferred)
+  facet_wrap(~ outcome, nrow = 1, scales = "free_x", labeller = label_value)
+
+# Print the final plot
+print(p2)
+
+# ggsave(
+#   filename = "ers_plot2.png",  # desired output file name
+#   plot = p,                   # your ggplot object
+#   device = "png",
+#   width = 10,                 # width in inches
+#   height = 7.5,                 # height in inches
+#   dpi = 600,                  # resolution in dots per inch
+#   units = "in"
+# )
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
